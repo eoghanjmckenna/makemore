@@ -1,278 +1,320 @@
 #!/usr/bin/env python3
 
+"""
+Universal Tokenizer Utility
+
+Usage Scenarios:
+----------------
+1) Create new tokenizers, optionally save them, and optionally tokenize:
+   python universal_tokenizer.py \
+       --data_folder /path/to/data \
+       --create_tokenizers \
+       --max_households_create 10 \
+       --num_bins 256 \
+       --save_tokenizers /path/to/tokenizers.pkl \
+       --do_tokenize \
+       --max_households_tokenize 10 \
+       --output_folder /path/to/tokenized_files \
+       --seed_create 42 \
+       --seed_tokenize 99
+
+2) Load existing tokenizers and tokenize:
+   python universal_tokenizer.py \
+       --data_folder /path/to/data \
+       --load_tokenizers /path/to/tokenizers.pkl \
+       --do_tokenize \
+       --max_households_tokenize 10 \
+       --output_folder /path/to/tokenized_files \
+       --seed_tokenize 99
+
+3) Load as a module in Python:
+   import universal_tokenizer as ut
+   elec_boundaries, gas_boundaries = ut.build_tokenizers_for_files([...])
+   ...
+"""
+
 import os
 import glob
 import argparse
+import random
+import pickle
+from collections import Counter
+from bisect import bisect_left
 
 import numpy as np
 import pandas as pd
 
 
 ###############################################################################
-# 1. Helper Functions: Naive Quantile Binning
+# 1. Core Functions for Building & Tokenizing
 ###############################################################################
 
 def build_quantile_boundaries(data_iterable, num_bins=256):
     """
-    Construct quantile boundaries using a naive sort-based approach.
-    WARNING: This requires loading the entire dataset into memory.
+    Build quantile boundaries by:
+      1. Counting unique values + frequencies (values rounded to nearest 0.1 Wh)
+      2. Sorting by numeric value
+      3. Computing cumulative distribution (CDF)
+      4. Determining each quantile cutoff
 
-    Args:
-      data_iterable: An iterable of numeric values (e.g., a list or NumPy array).
-      num_bins (int): Desired number of bins.
-
-    Returns:
-      boundaries (list of floats): A sorted list of bin edges (length = num_bins - 1).
-        For num_bins=256, you'll get 255 boundary values.
+    Returns: A list of bin edges (length = num_bins - 1).
     """
-    # Convert to a NumPy array, remove any NaNs for boundary calculation
-    data_array = np.array([v for v in data_iterable if not pd.isna(v)], dtype=float)
-    n = len(data_array)
-    if n == 0:
-        # Edge case: if data is empty, return an empty boundary list
+    counts = Counter()
+    for val in data_iterable:
+        if not pd.isna(val):
+            # Round to nearest 0.1 Wh to reduce float noise
+            rounded_val = round(val, 1)
+            counts[rounded_val] += 1
+
+    if not counts:
         return []
 
-    # Sort the entire array (O(N log N))
-    data_array.sort()
+    # Sort by numeric value
+    unique_items = sorted(counts.items(), key=lambda x: x[0])  # [(value, freq), ...]
+    unique_values = [item[0] for item in unique_items]
+    freqs = [item[1] for item in unique_items]
 
+    # Build CDF
+    cdf = []
+    running_sum = 0
+    for f in freqs:
+        running_sum += f
+        cdf.append(running_sum)
+    total_count = cdf[-1]
+
+    # Determine boundary for each quantile
     boundaries = []
-    # For example, with 256 bins, we compute boundaries at 1/256, 2/256, ..., 255/256 quantiles
     for i in range(1, num_bins):
-        # Index in the sorted array
-        q_idx = int(np.floor(i * n / num_bins))
-        if q_idx >= n:
-            q_idx = n - 1
-        boundaries.append(data_array[q_idx])
+        frac = i / num_bins
+        threshold = frac * total_count
+        idx = bisect_left(cdf, threshold)
+        boundaries.append(unique_values[idx])
+
     return boundaries
 
-###############################################################################
-# 2. Tokenization Functions
-###############################################################################
 
-def get_token(value, boundaries, missing_token, error_token, min_val=None, max_val=None):
+def build_tokenizers_for_files(file_paths, num_bins=256):
     """
-    Convert a numeric `value` into a discrete token index based on `boundaries`.
+    Aggregates all 'Clean_elec_imp_hh_Wh' and 'Clean_gas_hh_Wh' from the
+    given file paths, builds two sets of boundaries (elec & gas).
 
-    Args:
-      value: The numeric consumption value.
-      boundaries: List of sorted boundary values that define the bin edges.
-      missing_token: The integer token representing missing data.
-      error_token: The integer token representing out-of-bounds/error data.
-      min_val: Lower plausible bound for valid readings (None => use boundaries[0]).
-      max_val: Upper plausible bound for valid readings (None => use boundaries[-1]).
-
-    Returns:
-      An integer token index [0..len(boundaries)] or a special missing/error token.
+    Returns: (elec_boundaries, gas_boundaries)
     """
-    # Handle missing
-    if pd.isna(value):
-        return missing_token
-    
-    # If we have no boundaries (edge case with no valid data), treat as error
-    if len(boundaries) == 0:
-        return error_token
-
-    # Determine lower/upper from boundaries if none given
-    lower_bound = boundaries[0] if min_val is None else min_val
-    upper_bound = boundaries[-1] if max_val is None else max_val
-
-    # Handle errors / out-of-bounds
-    if value < lower_bound or value > upper_bound:
-        return error_token
-
-    # Binary search to find bin
-    lo, hi = 0, len(boundaries)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if value < boundaries[mid]:
-            hi = mid
-        else:
-            lo = mid + 1
-    # 'lo' is the bin index
-    return lo
-
-def decode_token(token_idx, boundaries, missing_token, error_token):
-    """
-    Inverse operation: map a token index back to a numeric estimate.
-    Uses the midpoint of the bin edges as a representative value.
-
-    Args:
-      token_idx: The integer token index.
-      boundaries: List of sorted boundary values.
-      missing_token: Special token index for missing data.
-      error_token: Special token index for errors.
-
-    Returns:
-      A float representing an approximate usage, or np.nan/None for special tokens.
-    """
-    if token_idx == missing_token:
-        return np.nan
-    if token_idx == error_token:
-        return None  # or another sentinel
-
-    num_bins = len(boundaries) + 1
-    # Bins: index in [0, num_bins-1]
-    # bin i covers [boundaries[i-1], boundaries[i]) with i in [1..num_bins-2],
-    # plus lower edge i=0 and upper edge i=(num_bins-1).
-    if token_idx == 0:
-        low_val = float('-inf')
-        high_val = boundaries[0]
-    elif token_idx == num_bins - 1:
-        low_val = boundaries[-1]
-        high_val = float('inf')
-    else:
-        low_val = boundaries[token_idx - 1] if token_idx > 0 else boundaries[0]
-        high_val = boundaries[token_idx] if token_idx < len(boundaries) else boundaries[-1]
-
-    # Use midpoint if finite
-    if np.isfinite(low_val) and np.isfinite(high_val):
-        return (low_val + high_val) / 2.0
-    elif not np.isfinite(low_val):
-        return high_val
-    else:
-        return low_val
-
-###############################################################################
-# 3. Main Processing: Reading PKL Files & Building Tokenizers
-###############################################################################
-
-def build_tokenizers_for_folder(folder_path, max_households=None, num_bins=256):
-    """
-    Reads up to `max_households` pickled DataFrames in `folder_path`, aggregates 
-    electricity and gas usage, then returns quantile boundaries for each.
-
-    Args:
-      folder_path (str): Path to the folder containing household .pkl files.
-      max_households (int or None): If specified, only read that many files.
-      num_bins (int): Number of bins for quantile splitting.
-
-    Returns:
-      elec_boundaries (list of floats),
-      gas_boundaries (list of floats)
-    """
-    file_paths = glob.glob(os.path.join(folder_path, "*.pkl"))
-    if max_households is not None:
-        file_paths = file_paths[:max_households]
-
     elec_values = []
     gas_values = []
 
     for fp in file_paths:
         df = pd.read_pickle(fp)
-        # We assume columns: datetime, halfhour_from_midnight,
-        #                    Clean_elec_imp_hh_Wh, Clean_gas_hh_Wh, temp_C
-
-        # Extend aggregator lists with valid numeric usage
         elec_values.extend(df['Clean_elec_imp_hh_Wh'].values)
         gas_values.extend(df['Clean_gas_hh_Wh'].values)
 
-    # Build quantile boundaries for electricity
-    print(f"Building electricity quantile boundaries from {len(elec_values)} records...")
-    elec_boundaries = build_quantile_boundaries(elec_values, num_bins=num_bins)
+    print(f"[BUILD] Found {len(elec_values)} electric values and "
+          f"{len(gas_values)} gas values in {len(file_paths)} files.")
 
-    # Build quantile boundaries for gas
-    print(f"Building gas quantile boundaries from {len(gas_values)} records...")
+    elec_boundaries = build_quantile_boundaries(elec_values, num_bins=num_bins)
     gas_boundaries = build_quantile_boundaries(gas_values, num_bins=num_bins)
 
     return elec_boundaries, gas_boundaries
 
-def tokenize_folder(folder_path, elec_boundaries, gas_boundaries, 
-                    output_folder=None, max_households=None):
-    """
-    Tokenizes each .pkl file in `folder_path` using the provided boundaries.
-    Optionally writes out a tokenized .pkl copy to `output_folder`.
 
-    Args:
-      folder_path (str): Path containing the .pkl files.
-      elec_boundaries (list of floats): Electricity bin edges.
-      gas_boundaries (list of floats): Gas bin edges.
-      output_folder (str or None): If specified, writes tokenized DataFrames to this folder.
-      max_households (int or None): Number of files to process for testing.
-
-    Returns:
-      None
+def get_token(value, boundaries, missing_token, error_token,
+              min_val=None, max_val=None):
     """
-    # Define special token indices
-    # For num_bins usage bins, total token range is [0..(num_bins-1)]
-    # We'll put missing_token and error_token after that range.
-    usage_bins = len(elec_boundaries) + 1  # e.g. 256
+    Convert a numeric value into a token index based on quantile boundaries.
+    Rounds the value to 0.1 Wh for consistency.
+    """
+    if pd.isna(value):
+        return missing_token
+
+    if len(boundaries) == 0:  # No data => treat as error
+        return error_token
+
+    rounded_val = round(value, 1)
+
+    low_bound = boundaries[0] if min_val is None else min_val
+    high_bound = boundaries[-1] if max_val is None else max_val
+
+    if rounded_val < low_bound or rounded_val > high_bound:
+        return error_token
+
+    # Use bisect to find bin
+    from bisect import bisect_left
+    idx = bisect_left(boundaries, rounded_val)
+    return idx
+
+
+def tokenize_files(file_paths, elec_boundaries, gas_boundaries,
+                   output_folder=None):
+    """
+    Applies the tokenizers to each file in file_paths. Optionally saves output.
+    """
+    usage_bins = len(elec_boundaries) + 1
     missing_token = usage_bins
     error_token = usage_bins + 1
 
-    file_paths = glob.glob(os.path.join(folder_path, "*.pkl"))
-    if max_households is not None:
-        file_paths = file_paths[:max_households]
-
-    # Create output folder if needed
     if output_folder and not os.path.exists(output_folder):
         os.makedirs(output_folder, exist_ok=True)
 
     for fp in file_paths:
         df = pd.read_pickle(fp)
-        
-        # Tokenize electricity
+
         df['Elec_Token'] = df['Clean_elec_imp_hh_Wh'].apply(
             lambda x: get_token(
-                x, elec_boundaries, 
-                missing_token=missing_token, 
-                error_token=error_token,
-                min_val=None,  # Optionally set a min
-                max_val=None   # Optionally set a max
+                x, elec_boundaries,
+                missing_token, error_token
             )
         )
-        
-        # Tokenize gas
         df['Gas_Token'] = df['Clean_gas_hh_Wh'].apply(
             lambda x: get_token(
-                x, gas_boundaries, 
-                missing_token=missing_token, 
-                error_token=error_token,
-                min_val=None,
-                max_val=None
+                x, gas_boundaries,
+                missing_token, error_token
             )
         )
 
-        # Optionally save the tokenized data
         if output_folder:
             base_name = os.path.basename(fp)
-            out_fp = os.path.join(output_folder, base_name.replace(".pkl", "_tokenized.pkl"))
+            out_fp = os.path.join(output_folder,
+                                  base_name.replace(".pkl", "_tokenized.pkl"))
             df.to_pickle(out_fp)
 
-        print(f"Tokenized file: {fp}")
+        print(f"[TOKENIZE] Processed file: {fp}")
+
 
 ###############################################################################
-# 4. Command-Line Interface
+# 2. Saving & Loading the Boundaries
+###############################################################################
+
+def save_tokenizers(elec_boundaries, gas_boundaries, out_path):
+    """Save boundaries to a pickle file."""
+    data = {
+        "elec_boundaries": elec_boundaries,
+        "gas_boundaries": gas_boundaries
+    }
+    with open(out_path, "wb") as f:
+        pickle.dump(data, f)
+    print(f"[SAVE] Tokenizers saved to {out_path}")
+
+
+def load_tokenizers(in_path):
+    """Load boundaries from a pickle file."""
+    with open(in_path, "rb") as f:
+        data = pickle.load(f)
+    elec_boundaries = data["elec_boundaries"]
+    gas_boundaries = data["gas_boundaries"]
+    print(f"[LOAD] Tokenizers loaded from {in_path}")
+    return elec_boundaries, gas_boundaries
+
+
+###############################################################################
+# 3. Utility Functions for Gathering File Paths with Optional Random Sampling
+###############################################################################
+
+def get_file_paths(folder_path, max_households=None, seed=None):
+    """
+    Returns a list of .pkl file paths in `folder_path`.
+    If max_households < total number of files, randomly sample that many.
+    """
+    files = glob.glob(os.path.join(folder_path, "*.pkl"))
+    print(f"[FILES] Found {len(files)} pkl files in {folder_path}.")
+
+    if seed is not None:
+        random.seed(seed)
+
+    if max_households is not None and max_households < len(files):
+        files = random.sample(files, max_households)
+        print(f"[FILES] Randomly selected {len(files)} out of {len(files)} with seed={seed}.")
+
+    return files
+
+
+###############################################################################
+# 4. Main (CLI) - Putting It All Together
 ###############################################################################
 
 def main():
-    parser = argparse.ArgumentParser(description="Universal Tokenizer (Naive) for Household Data")
+    parser = argparse.ArgumentParser(description="Universal Tokenizer Utility")
+    # Flags for optional actions
+    parser.add_argument("--create_tokenizers", action="store_true",
+                        help="If set, build new tokenizers from data.")
+    parser.add_argument("--do_tokenize", action="store_true",
+                        help="If set, tokenize the data using the tokenizers (created or loaded).")
+
+    # Folder for data
     parser.add_argument("--data_folder", type=str, required=True,
-                        help="Path to folder containing household .pkl files.")
-    parser.add_argument("--max_households", type=int, default=None,
-                        help="If specified, process only this many files for testing.")
+                        help="Folder containing .pkl files.")
+
+    # Options for building tokenizers
+    parser.add_argument("--max_households_create", type=int, default=None,
+                        help="If creating tokenizers, randomly sample this many files.")
+    parser.add_argument("--seed_create", type=int, default=None,
+                        help="Random seed for selecting files for building tokenizers.")
     parser.add_argument("--num_bins", type=int, default=256,
-                        help="Number of bins for quantile splitting.")
+                        help="Number of bins for quantile splitting when creating tokenizers.")
+
+    # Options for loading tokenizers
+    parser.add_argument("--load_tokenizers", type=str, default=None,
+                        help="Path to an existing .pkl tokenizers file to load (skip creation).")
+
+    # Options for saving tokenizers
+    parser.add_argument("--save_tokenizers", type=str, default=None,
+                        help="Path to save created tokenizers (if create_tokenizers is true).")
+
+    # Options for tokenizing
+    parser.add_argument("--max_households_tokenize", type=int, default=None,
+                        help="If tokenizing, randomly sample this many files.")
+    parser.add_argument("--seed_tokenize", type=int, default=None,
+                        help="Random seed for selecting files for tokenization.")
     parser.add_argument("--output_folder", type=str, default=None,
-                        help="Folder to write tokenized .pkl files. If not specified, no output is written.")
+                        help="Folder to write tokenized .pkl files.")
+
     args = parser.parse_args()
 
-    # Step 1: Build boundaries (electricity + gas)
-    elec_boundaries, gas_boundaries = build_tokenizers_for_folder(
-        folder_path=args.data_folder,
-        max_households=args.max_households,
-        num_bins=args.num_bins
-    )
+    # 1. Decide how to get the tokenizers
+    elec_boundaries, gas_boundaries = None, None
 
-    # Step 2: Tokenize each file
-    tokenize_folder(
-        folder_path=args.data_folder,
-        elec_boundaries=elec_boundaries,
-        gas_boundaries=gas_boundaries,
-        output_folder=args.output_folder,
-        max_households=args.max_households
-    )
+    if args.load_tokenizers:
+        # If user provided a path to load from, do that first
+        elec_boundaries, gas_boundaries = load_tokenizers(args.load_tokenizers)
+    elif args.create_tokenizers:
+        # If user wants to create them
+        file_paths_create = get_file_paths(
+            folder_path=args.data_folder,
+            max_households=args.max_households_create,
+            seed=args.seed_create
+        )
+        elec_boundaries, gas_boundaries = build_tokenizers_for_files(
+            file_paths=file_paths_create,
+            num_bins=args.num_bins
+        )
+        # Optionally save
+        if args.save_tokenizers:
+            save_tokenizers(elec_boundaries, gas_boundaries, args.save_tokenizers)
 
-    print("Tokenization process completed successfully.")
+    # If we still don't have boundaries, and user wants to tokenize => problem
+    if args.do_tokenize and (elec_boundaries is None or gas_boundaries is None):
+        raise ValueError("Cannot tokenize without tokenizers. "
+                         "Either load them or create them first.")
+
+    # 2. Tokenize if requested
+    if args.do_tokenize:
+        file_paths_tokenize = get_file_paths(
+            folder_path=args.data_folder,
+            max_households=args.max_households_tokenize,
+            seed=args.seed_tokenize
+        )
+        tokenize_files(
+            file_paths=file_paths_tokenize,
+            elec_boundaries=elec_boundaries,
+            gas_boundaries=gas_boundaries,
+            output_folder=args.output_folder
+        )
+
+    print("[DONE] All requested operations completed.")
+
+
+###############################################################################
+# 5. If Running as a Script
+###############################################################################
 
 if __name__ == "__main__":
     main()
