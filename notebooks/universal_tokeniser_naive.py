@@ -148,9 +148,14 @@ def tokenize_files(file_paths, elec_boundaries, gas_boundaries,
     """
     Applies the tokenizers to each file in file_paths. Optionally saves output.
     """
-    usage_bins = len(elec_boundaries) + 1
-    missing_token = usage_bins
-    error_token = usage_bins + 1
+    # Separate token definitions for electricity and gas
+    elec_usage_bins = len(elec_boundaries) + 1
+    elec_missing_token = elec_usage_bins
+    elec_error_token = elec_usage_bins + 1
+
+    gas_usage_bins = len(gas_boundaries) + 1
+    gas_missing_token = gas_usage_bins
+    gas_error_token = gas_usage_bins + 1
 
     if output_folder and not os.path.exists(output_folder):
         os.makedirs(output_folder, exist_ok=True)
@@ -161,13 +166,13 @@ def tokenize_files(file_paths, elec_boundaries, gas_boundaries,
         df['Elec_Token'] = df['Clean_elec_imp_hh_Wh'].apply(
             lambda x: get_token(
                 x, elec_boundaries,
-                missing_token, error_token
+                elec_missing_token, elec_error_token
             )
         )
         df['Gas_Token'] = df['Clean_gas_hh_Wh'].apply(
             lambda x: get_token(
                 x, gas_boundaries,
-                missing_token, error_token
+                gas_missing_token, gas_error_token
             )
         )
 
